@@ -4,6 +4,11 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/graph"
+	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/tf"
+
+	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/validate"
+
 	"github.com/hashicorp/go-azure-helpers/response"
 	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/ar"
 	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/p"
@@ -12,7 +17,7 @@ import (
 	"github.com/hashicorp/terraform/helper/schema"
 )
 
-var servicePrincipalResourceName = "azuread_service_principal"
+const servicePrincipalResourceName = "azuread_service_principal"
 
 func resourceServicePrincipal() *schema.Resource {
 	return &schema.Resource{
@@ -25,12 +30,28 @@ func resourceServicePrincipal() *schema.Resource {
 
 		Schema: map[string]*schema.Schema{
 			"application_id": {
-				Type:     schema.TypeString,
-				Required: true,
+				Type:         schema.TypeString,
+				Required:     true,
+				ForceNew:     true,
+				ValidateFunc: validate.UUID,
+			},
+
+			"tags": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Set:      schema.HashString,
 				ForceNew: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
 			},
 
 			"display_name": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"object_id": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
@@ -50,19 +71,25 @@ func resourceServicePrincipalCreate(d *schema.ResourceData, meta interface{}) er
 		// given there's no way to change it - we'll just default this to true
 		AccountEnabled: p.Bool(true),
 	}
-
-	app, err := client.Create(ctx, properties)
-	if err != nil {
-		return fmt.Errorf("Error creating Service Principal %q: %+v", applicationId, err)
+	if v, ok := d.GetOk("tags"); ok {
+		properties.Tags = tf.ExpandStringSlicePtr(v.(*schema.Set).List())
 	}
 
-	objectId := *app.ObjectID
-	resp, err := client.Get(ctx, objectId)
+	sp, err := client.Create(ctx, properties)
 	if err != nil {
-		return fmt.Errorf("Error retrieving Service Principal ID %q: %+v", objectId, err)
+		return fmt.Errorf("Error creating Service Principal for application  %q: %+v", applicationId, err)
 	}
+	if sp.ObjectID == nil {
+		return fmt.Errorf("Service Principal	objectID is nil")
+	}
+	d.SetId(*sp.ObjectID)
 
-	d.SetId(*resp.ObjectID)
+	_, err = graph.WaitForReplication(func() (interface{}, error) {
+		return client.Get(ctx, *sp.ObjectID)
+	})
+	if err != nil {
+		return fmt.Errorf("Error waiting for Service Pricipal with ObjectId %q: %+v", *sp.ObjectID, err)
+	}
 
 	return resourceServicePrincipalRead(d, meta)
 }
@@ -72,6 +99,7 @@ func resourceServicePrincipalRead(d *schema.ResourceData, meta interface{}) erro
 	ctx := meta.(*ArmClient).StopContext
 
 	objectId := d.Id()
+
 	app, err := client.Get(ctx, objectId)
 	if err != nil {
 		if ar.ResponseWasNotFound(app.Response) {
@@ -84,6 +112,16 @@ func resourceServicePrincipalRead(d *schema.ResourceData, meta interface{}) erro
 
 	d.Set("application_id", app.AppID)
 	d.Set("display_name", app.DisplayName)
+	d.Set("object_id", app.ObjectID)
+
+	// tags doesn't exist as a property, so extract it
+	if iTags, ok := app.AdditionalProperties["tags"]; ok {
+		if tags, ok := iTags.([]interface{}); ok {
+			if err := d.Set("tags", tf.ExpandStringSlicePtr(tags)); err != nil {
+				return fmt.Errorf("Error setting `tags`: %+v", err)
+			}
+		}
+	}
 
 	return nil
 }

@@ -4,14 +4,18 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/terraform/helper/validation"
-	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/validate"
-
 	"github.com/Azure/azure-sdk-for-go/services/graphrbac/1.6/graphrbac"
+
 	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform/helper/validation"
 	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/ar"
+	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/graph"
 	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/p"
+	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/tf"
+	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/validate"
 )
+
+const resourceApplicationName = "azuread_application"
 
 func resourceApplication() *schema.Resource {
 	return &schema.Resource{
@@ -42,7 +46,6 @@ func resourceApplication() *schema.Resource {
 				Type:     schema.TypeList,
 				Optional: true,
 				Computed: true,
-				MinItems: 1,
 				Elem: &schema.Schema{
 					Type:         schema.TypeString,
 					ValidateFunc: validate.URLIsHTTPOrHTTPS,
@@ -50,12 +53,12 @@ func resourceApplication() *schema.Resource {
 			},
 
 			"reply_urls": {
-				Type:     schema.TypeList,
+				Type:     schema.TypeSet,
 				Optional: true,
 				Computed: true,
 				Elem: &schema.Schema{
 					Type:         schema.TypeString,
-					ValidateFunc: validate.URLIsHTTPOrHTTPS,
+					ValidateFunc: validate.NoEmptyStrings,
 				},
 			},
 
@@ -73,6 +76,111 @@ func resourceApplication() *schema.Resource {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
+
+			"group_membership_claims": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ValidateFunc: validation.StringInSlice(
+					[]string{"None", "SecurityGroup", "All"},
+					false,
+				),
+			},
+
+			"type": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ValidateFunc: validation.StringInSlice([]string{"webapp/api", "native"}, false),
+				Default:      "webapp/api",
+			},
+
+			"required_resource_access": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"resource_app_id": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+
+						"resource_access": {
+							Type:     schema.TypeList,
+							Required: true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"id": {
+										Type:         schema.TypeString,
+										Required:     true,
+										ValidateFunc: validate.UUID,
+									},
+
+									"type": {
+										Type:     schema.TypeString,
+										Required: true,
+										ValidateFunc: validation.StringInSlice(
+											[]string{"Scope", "Role"},
+											false, // force case sensitivity
+										),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+
+			"oauth2_permissions": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"admin_consent_description": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"admin_consent_display_name": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"id": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"is_enabled": {
+							Type:     schema.TypeBool,
+							Computed: true,
+						},
+
+						"type": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"user_consent_description": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"user_consent_display_name": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"value": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+					},
+				},
+			},
+
+			"object_id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
 		},
 	}
 }
@@ -82,25 +190,73 @@ func resourceApplicationCreate(d *schema.ResourceData, meta interface{}) error {
 	ctx := meta.(*ArmClient).StopContext
 
 	name := d.Get("name").(string)
+	appType := d.Get("type")
+	identUrls, hasIdentUrls := d.GetOk("identifier_uris")
+	if appType == "native" {
+		if hasIdentUrls {
+			return fmt.Errorf("identifier_uris is not required for a native application")
+		}
+	}
 
 	properties := graphrbac.ApplicationCreateParameters{
+		AdditionalProperties:    make(map[string]interface{}),
 		DisplayName:             &name,
-		Homepage:                expandADApplicationHomepage(d, name),
-		IdentifierUris:          expandADApplicationIdentifierUris(d),
-		ReplyUrls:               expandADApplicationReplyUrls(d),
+		IdentifierUris:          tf.ExpandStringSlicePtr(identUrls.([]interface{})),
+		ReplyUrls:               tf.ExpandStringSlicePtr(d.Get("reply_urls").(*schema.Set).List()),
 		AvailableToOtherTenants: p.Bool(d.Get("available_to_other_tenants").(bool)),
+		RequiredResourceAccess:  expandADApplicationRequiredResourceAccess(d),
+	}
+
+	if v, ok := d.GetOk("homepage"); ok {
+		properties.Homepage = p.String(v.(string))
+	} else {
+		// continue to automatically set the homepage with the type is not native
+		if appType != "native" {
+			properties.Homepage = p.String(fmt.Sprintf("https://%s", name))
+
+		}
 	}
 
 	if v, ok := d.GetOk("oauth2_allow_implicit_flow"); ok {
 		properties.Oauth2AllowImplicitFlow = p.Bool(v.(bool))
 	}
 
+	if v, ok := d.GetOk("group_membership_claims"); ok {
+		properties.AdditionalProperties["groupMembershipClaims"] = v
+	}
+
 	app, err := client.Create(ctx, properties)
 	if err != nil {
 		return err
 	}
-
+	if app.ObjectID == nil {
+		return fmt.Errorf("Application objectId is nil")
+	}
 	d.SetId(*app.ObjectID)
+
+	_, err = graph.WaitForReplication(func() (interface{}, error) {
+		return client.Get(ctx, *app.ObjectID)
+	})
+	if err != nil {
+		return fmt.Errorf("Error waiting for Application with ObjectId %q: %+v", *app.ObjectID, err)
+	}
+
+	// follow suggested hack for azure-cli
+	// AAD graph doesn't have the API to create a native app, aka public client, the recommended hack is
+	// to create a web app first, then convert to a native one
+	if appType == "native" {
+
+		properties := graphrbac.ApplicationUpdateParameters{
+			Homepage:       nil,
+			IdentifierUris: &[]string{},
+			AdditionalProperties: map[string]interface{}{
+				"publicClient": true,
+			},
+		}
+		if _, err := client.Patch(ctx, *app.ObjectID, properties); err != nil {
+			return err
+		}
+	}
 
 	return resourceApplicationRead(d, meta)
 }
@@ -112,21 +268,22 @@ func resourceApplicationUpdate(d *schema.ResourceData, meta interface{}) error {
 	name := d.Get("name").(string)
 
 	var properties graphrbac.ApplicationUpdateParameters
+	properties.AdditionalProperties = make(map[string]interface{})
 
 	if d.HasChange("name") {
 		properties.DisplayName = &name
 	}
 
 	if d.HasChange("homepage") {
-		properties.Homepage = expandADApplicationHomepage(d, name)
+		properties.Homepage = p.String(d.Get("homepage").(string))
 	}
 
 	if d.HasChange("identifier_uris") {
-		properties.IdentifierUris = expandADApplicationIdentifierUris(d)
+		properties.IdentifierUris = tf.ExpandStringSlicePtr(d.Get("identifier_uris").([]interface{}))
 	}
 
 	if d.HasChange("reply_urls") {
-		properties.ReplyUrls = expandADApplicationReplyUrls(d)
+		properties.ReplyUrls = tf.ExpandStringSlicePtr(d.Get("reply_urls").(*schema.Set).List())
 	}
 
 	if d.HasChange("available_to_other_tenants") {
@@ -137,6 +294,34 @@ func resourceApplicationUpdate(d *schema.ResourceData, meta interface{}) error {
 	if d.HasChange("oauth2_allow_implicit_flow") {
 		oauth := d.Get("oauth2_allow_implicit_flow").(bool)
 		properties.Oauth2AllowImplicitFlow = p.Bool(oauth)
+	}
+
+	if d.HasChange("required_resource_access") {
+		properties.RequiredResourceAccess = expandADApplicationRequiredResourceAccess(d)
+	}
+
+	if d.HasChange("group_membership_claims") {
+		groupMembershipClaims := d.Get("group_membership_claims").(string)
+
+		if len(groupMembershipClaims) == 0 {
+			properties.AdditionalProperties["groupMembershipClaims"] = nil
+		} else {
+			properties.AdditionalProperties["groupMembershipClaims"] = groupMembershipClaims
+		}
+	}
+
+	if d.HasChange("type") {
+		switch appType := d.Get("type"); appType {
+		case "webapp/api":
+			properties.AdditionalProperties["publicClient"] = false
+			properties.IdentifierUris = tf.ExpandStringSlicePtr(d.Get("identifier_uris").([]interface{}))
+		case "native":
+			properties.AdditionalProperties["publicClient"] = true
+			properties.IdentifierUris = &[]string{}
+		default:
+			return fmt.Errorf("Error paching Azure AD Application with ID %q: Unknow application type %v. Supported types are [webapp/api, native]", d.Id(), appType)
+
+		}
 	}
 
 	if _, err := client.Patch(ctx, d.Id(), properties); err != nil {
@@ -166,21 +351,33 @@ func resourceApplicationRead(d *schema.ResourceData, meta interface{}) error {
 	d.Set("homepage", resp.Homepage)
 	d.Set("available_to_other_tenants", resp.AvailableToOtherTenants)
 	d.Set("oauth2_allow_implicit_flow", resp.Oauth2AllowImplicitFlow)
+	d.Set("object_id", resp.ObjectID)
 
-	identifierUris := make([]string, 0)
-	if s := resp.IdentifierUris; s != nil {
-		identifierUris = *s
+	if groupMembershipClaims, ok := resp.AdditionalProperties["groupMembershipClaims"]; ok {
+		d.Set("group_membership_claims", groupMembershipClaims)
 	}
-	if err := d.Set("identifier_uris", identifierUris); err != nil {
+
+	switch appType := resp.AdditionalProperties["publicClient"]; appType {
+	case true:
+		d.Set("type", "native")
+	default:
+		d.Set("type", "webapp/api")
+	}
+
+	if err := d.Set("identifier_uris", tf.FlattenStringSlicePtr(resp.IdentifierUris)); err != nil {
 		return fmt.Errorf("Error setting `identifier_uris`: %+v", err)
 	}
 
-	replyUrls := make([]string, 0)
-	if s := resp.IdentifierUris; s != nil {
-		replyUrls = *s
-	}
-	if err := d.Set("reply_urls", replyUrls); err != nil {
+	if err := d.Set("reply_urls", tf.FlattenStringSlicePtr(resp.ReplyUrls)); err != nil {
 		return fmt.Errorf("Error setting `reply_urls`: %+v", err)
+	}
+
+	if err := d.Set("required_resource_access", flattenADApplicationRequiredResourceAccess(resp.RequiredResourceAccess)); err != nil {
+		return fmt.Errorf("Error setting `required_resource_access`: %+v", err)
+	}
+
+	if oauth2Permissions, ok := resp.AdditionalProperties["oauth2Permissions"].([]interface{}); ok {
+		d.Set("oauth2_permissions", flattenADApplicationOauth2Permissions(oauth2Permissions))
 	}
 
 	return nil
@@ -197,8 +394,8 @@ func resourceApplicationDelete(d *schema.ResourceData, meta interface{}) error {
 		properties := graphrbac.ApplicationUpdateParameters{
 			AvailableToOtherTenants: p.Bool(false),
 		}
-		_, err := client.Patch(ctx, d.Id(), properties)
-		if err != nil {
+
+		if _, err := client.Patch(ctx, d.Id(), properties); err != nil {
 			return fmt.Errorf("Error patching Azure AD Application with ID %q: %+v", d.Id(), err)
 		}
 	}
@@ -213,32 +410,121 @@ func resourceApplicationDelete(d *schema.ResourceData, meta interface{}) error {
 	return nil
 }
 
-func expandADApplicationHomepage(d *schema.ResourceData, name string) *string {
-	if v, ok := d.GetOk("homepage"); ok {
-		return p.String(v.(string))
-	}
+func expandADApplicationRequiredResourceAccess(d *schema.ResourceData) *[]graphrbac.RequiredResourceAccess {
+	requiredResourcesAccesses := d.Get("required_resource_access").(*schema.Set).List()
+	result := make([]graphrbac.RequiredResourceAccess, 0)
 
-	return p.String(fmt.Sprintf("https://%s", name))
+	for _, raw := range requiredResourcesAccesses {
+		requiredResourceAccess := raw.(map[string]interface{})
+		resource_app_id := requiredResourceAccess["resource_app_id"].(string)
+
+		result = append(result,
+			graphrbac.RequiredResourceAccess{
+				ResourceAppID: &resource_app_id,
+				ResourceAccess: expandADApplicationResourceAccess(
+					requiredResourceAccess["resource_access"].([]interface{}),
+				),
+			},
+		)
+	}
+	return &result
 }
 
-func expandADApplicationIdentifierUris(d *schema.ResourceData) *[]string {
-	identifierUris := d.Get("identifier_uris").([]interface{})
-	identifiers := make([]string, 0)
+func expandADApplicationResourceAccess(in []interface{}) *[]graphrbac.ResourceAccess {
+	var resourceAccesses []graphrbac.ResourceAccess
+	for _, resource_access_raw := range in {
+		resource_access := resource_access_raw.(map[string]interface{})
 
-	for _, id := range identifierUris {
-		identifiers = append(identifiers, id.(string))
+		resourceId := resource_access["id"].(string)
+		resourceType := resource_access["type"].(string)
+
+		resourceAccesses = append(resourceAccesses,
+			graphrbac.ResourceAccess{
+				ID:   &resourceId,
+				Type: &resourceType,
+			},
+		)
 	}
 
-	return &identifiers
+	return &resourceAccesses
 }
 
-func expandADApplicationReplyUrls(d *schema.ResourceData) *[]string {
-	replyUrls := d.Get("reply_urls").([]interface{})
-	urls := make([]string, 0)
-
-	for _, url := range replyUrls {
-		urls = append(urls, url.(string))
+func flattenADApplicationRequiredResourceAccess(in *[]graphrbac.RequiredResourceAccess) []map[string]interface{} {
+	if in == nil {
+		return []map[string]interface{}{}
 	}
 
-	return &urls
+	result := make([]map[string]interface{}, 0, len(*in))
+	for _, requiredResourceAccess := range *in {
+		resource := make(map[string]interface{})
+		if requiredResourceAccess.ResourceAppID != nil {
+			resource["resource_app_id"] = *requiredResourceAccess.ResourceAppID
+		}
+
+		resource["resource_access"] = flattenADApplicationResourceAccess(requiredResourceAccess.ResourceAccess)
+
+		result = append(result, resource)
+	}
+
+	return result
+}
+
+func flattenADApplicationResourceAccess(in *[]graphrbac.ResourceAccess) []interface{} {
+	if in == nil {
+		return []interface{}{}
+	}
+
+	accesses := make([]interface{}, 0)
+	for _, resourceAccess := range *in {
+		access := make(map[string]interface{})
+		if resourceAccess.ID != nil {
+			access["id"] = *resourceAccess.ID
+		}
+		if resourceAccess.Type != nil {
+			access["type"] = *resourceAccess.Type
+		}
+		accesses = append(accesses, access)
+	}
+
+	return accesses
+}
+
+func flattenADApplicationOauth2Permissions(in []interface{}) []map[string]interface{} {
+	if in == nil {
+		return []map[string]interface{}{}
+	}
+
+	result := make([]map[string]interface{}, 0, len(in))
+	for _, oauth2Permissions := range in {
+		rawPermission := oauth2Permissions.(map[string]interface{})
+		permission := make(map[string]interface{})
+		if v := rawPermission["adminConsentDescription"]; v != nil {
+			permission["admin_consent_description"] = v
+		}
+		if v := rawPermission["adminConsentDisplayName"]; v != nil {
+			permission["admin_consent_description"] = v
+		}
+		if v := rawPermission["id"]; v != nil {
+			permission["id"] = v
+		}
+		if v := rawPermission["isEnabled"]; v != nil {
+			permission["is_enabled"] = v.(bool)
+		}
+		if v := rawPermission["type"]; v != nil {
+			permission["type"] = v
+		}
+		if v := rawPermission["userConsentDescription"]; v != nil {
+			permission["user_consent_description"] = v
+		}
+		if v := rawPermission["userConsentDisplayName"]; v != nil {
+			permission["user_consent_display_name"] = v
+		}
+		if v := rawPermission["value"]; v != nil {
+			permission["value"] = v
+		}
+
+		result = append(result, permission)
+	}
+
+	return result
 }

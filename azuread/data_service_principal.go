@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/ar"
+	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/validate"
 
 	"github.com/Azure/azure-sdk-for-go/services/graphrbac/1.6/graphrbac"
 	"github.com/hashicorp/terraform/helper/schema"
@@ -18,6 +19,7 @@ func dataServicePrincipal() *schema.Resource {
 				Type:          schema.TypeString,
 				Optional:      true,
 				Computed:      true,
+				ValidateFunc:  validate.UUID,
 				ConflictsWith: []string{"display_name", "application_id"},
 			},
 
@@ -25,6 +27,7 @@ func dataServicePrincipal() *schema.Resource {
 				Type:          schema.TypeString,
 				Optional:      true,
 				Computed:      true,
+				ValidateFunc:  validate.NoEmptyStrings,
 				ConflictsWith: []string{"object_id", "application_id"},
 			},
 
@@ -32,6 +35,7 @@ func dataServicePrincipal() *schema.Resource {
 				Type:          schema.TypeString,
 				Optional:      true,
 				Computed:      true,
+				ValidateFunc:  validate.UUID,
 				ConflictsWith: []string{"object_id", "display_name"},
 			},
 		},
@@ -42,7 +46,7 @@ func dataSourceActiveDirectoryServicePrincipalRead(d *schema.ResourceData, meta 
 	client := meta.(*ArmClient).servicePrincipalsClient
 	ctx := meta.(*ArmClient).StopContext
 
-	var servicePrincipal *graphrbac.ServicePrincipal
+	var sp *graphrbac.ServicePrincipal
 
 	if v, ok := d.GetOk("object_id"); ok {
 
@@ -57,7 +61,7 @@ func dataSourceActiveDirectoryServicePrincipalRead(d *schema.ResourceData, meta 
 			return fmt.Errorf("Error retrieving Service Principal ID %q: %+v", objectId, err)
 		}
 
-		servicePrincipal = &app
+		sp = &app
 
 	} else if _, ok := d.GetOk("display_name"); ok {
 
@@ -76,12 +80,12 @@ func dataSourceActiveDirectoryServicePrincipalRead(d *schema.ResourceData, meta 
 			}
 
 			if *app.DisplayName == displayName {
-				servicePrincipal = &app
+				sp = &app
 				break
 			}
 		}
 
-		if servicePrincipal == nil {
+		if sp == nil {
 			return fmt.Errorf("A Service Principal with the Display Name %q was not found", displayName)
 		}
 
@@ -102,22 +106,25 @@ func dataSourceActiveDirectoryServicePrincipalRead(d *schema.ResourceData, meta 
 			}
 
 			if *app.AppID == applicationId {
-				servicePrincipal = &app
+				sp = &app
 				break
 			}
 		}
 
-		if servicePrincipal == nil {
+		if sp == nil {
 			return fmt.Errorf("A Service Principal for Application ID %q was not found", applicationId)
 		}
 
 	}
 
-	d.SetId(*servicePrincipal.ObjectID)
+	if sp.ObjectID == nil {
+		return fmt.Errorf("Service Principal objectId is nil")
+	}
+	d.SetId(*sp.ObjectID)
 
-	d.Set("application_id", servicePrincipal.AppID)
-	d.Set("display_name", servicePrincipal.DisplayName)
-	d.Set("object_id", servicePrincipal.ObjectID)
+	d.Set("application_id", sp.AppID)
+	d.Set("display_name", sp.DisplayName)
+	d.Set("object_id", sp.ObjectID)
 
 	return nil
 }
